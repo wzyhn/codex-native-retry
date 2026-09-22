@@ -1369,11 +1369,19 @@ def _process_alive(pid: Optional[int]) -> bool:
             import ctypes
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            kernel32.GetExitCodeProcess.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
             handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
                 return False
+            code = ctypes.c_uint32()
+            alive = bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
             kernel32.CloseHandle(handle)
-            return True
+            return alive
         except (AttributeError, OSError):
             return False
     try:
