@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+*.jsonl
+observer-status.json
+config.json
+.env
+.env.*
+dist/
+build/
