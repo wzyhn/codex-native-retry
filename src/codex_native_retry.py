@@ -1364,6 +1364,18 @@ def _read_pid(kind: str) -> Optional[int]:
 def _process_alive(pid: Optional[int]) -> bool:
     if pid is None or pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except (AttributeError, OSError):
+            return False
     try:
         os.kill(pid, 0)
     except PermissionError:
