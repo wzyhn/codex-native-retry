@@ -32,4 +32,4 @@ The official empty-input test asserts that the request does not synthesize an em
 
 Read-only initialization and thread listing succeeded through the proxy. After correcting the `systemError` guard, a previously failed capacity turn received `turn_start_accepted`, followed by a new turn in the same thread. A subsequent capacity failure carried the attempt budget into the next backoff.
 
-No raw thread identifiers, conversation contents, workstation paths, private repository details, or raw IPC captures are included here. A complete Desktop-button-versus-companion capture comparison was not performed. See the [equivalence report](native-retry-equivalence.md) for the limits of this evidence.
+No raw thread identifiers, conversation contents, workstation paths, private repository details, or raw IPC captures are included here. A complete Desktop-button-versus-companion capture comparison was not performed. The supported CLI route is intentionally narrower. See the [equivalence report](native-retry-equivalence.md) for the limits of this evidence.

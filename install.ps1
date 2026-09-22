@@ -1,5 +1,6 @@
 param(
-    [switch]$StartWithWindows
+    [switch]$StartWithWindows,
+    [switch]$Live
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,9 +14,9 @@ if (-not (Test-Path -LiteralPath $config)) {
   "enabled": true,
   "dry_run": true,
   "retry_mode": "dry_run",
-  "initial_delay_seconds": 5,
+  "retry_delays_seconds": [0, 3, 5, 10, 15, 30, 60],
   "max_delay_seconds": 60,
-  "max_attempts": 5,
+  "max_attempts": 0,
   "jitter_ratio": 0.2,
   "poll_seconds": 5
 }
@@ -29,11 +30,13 @@ if ($StartWithWindows) {
     if (-not $pythonCommand) { $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue }
     if (-not $pythonCommand) { throw 'python.exe was not found on PATH' }
     $python = $pythonCommand.Source
-    $line = '@echo off' + [Environment]::NewLine + 'start "" /min "' + $python + '" "' + $project + '\src\codex_native_retry.py" watch --dry-run' + [Environment]::NewLine
+    $mode = if ($Live) { 'start' } else { 'start --dry-run' }
+    $line = '@echo off' + [Environment]::NewLine + 'start "" /min "' + $python + '" "' + $project + '\src\codex_native_retry.py" ' + $mode + [Environment]::NewLine
     $line | Set-Content -LiteralPath $cmd -Encoding ASCII
-    Write-Host "Created $cmd (dry-run)."
+    Write-Host "Created $cmd ($mode)."
 }
 
 Write-Host "Installed Codex Native Retry in $project"
 Write-Host "Config: $config"
 Write-Host "Run: python `"$project\src\codex_native_retry.py`" diagnose"
+Write-Host "Start all services: `"$project\start.ps1`""

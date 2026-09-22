@@ -19,6 +19,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,6 +32,8 @@ from typing import Any, Callable, Optional
 
 CAPACITY_MESSAGE = "selected model is at capacity. please try a different model."
 TOOL_VERSION = "0.2.0"
+DEFAULT_RETRY_DELAYS = (0.0, 3.0, 5.0, 10.0, 15.0, 30.0, 60.0)
+PID_FILENAMES = {"watcher": "watcher.pid", "app_server": "app-server.pid"}
 GUID_RE = re.compile(
     r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
@@ -261,14 +264,28 @@ class RecoveryEngine:
     def __init__(
         self,
         *,
-        initial_delay: float = 5.0,
+        retry_delays: Optional[list[float] | tuple[float, ...]] = None,
+        initial_delay: Optional[float] = None,
         max_delay: float = 60.0,
-        max_attempts: int = 5,
+        max_attempts: int = 0,
         jitter_ratio: float = 0.2,
         random_fn: Callable[[], float] = random.random,
     ) -> None:
-        self.initial_delay = max(0.0, initial_delay)
-        self.max_delay = max(self.initial_delay, max_delay)
+        self.max_delay = max(0.0, max_delay)
+        if retry_delays is None:
+            # Keep callers that used the old initial_delay argument working,
+            # while the normal/default path uses the explicit user-facing
+            # schedule: immediate, 3, 5, 10, 15, 30, then 60 seconds.
+            if initial_delay is None:
+                retry_delays = list(DEFAULT_RETRY_DELAYS)
+            else:
+                legacy_initial = max(0.0, float(initial_delay))
+                retry_delays = [min(self.max_delay, legacy_initial * (2**index))
+                                for index in range(len(DEFAULT_RETRY_DELAYS))]
+        normalized = [max(0.0, float(value)) for value in retry_delays]
+        if not normalized:
+            normalized = list(DEFAULT_RETRY_DELAYS)
+        self.retry_delays = tuple(min(self.max_delay, value) for value in normalized)
         self.max_attempts = max(0, max_attempts)  # 0 is explicit unlimited mode.
         self.jitter_ratio = max(0.0, min(1.0, jitter_ratio))
         self.random_fn = random_fn
@@ -309,7 +326,7 @@ class RecoveryEngine:
             self._generation[event.thread_id] = generation
             delay = self._delay(attempt)
             if isinstance(event.retry_after_seconds, (int, float)) and event.retry_after_seconds > delay:
-                delay = event.retry_after_seconds
+                delay = min(self.max_delay, event.retry_after_seconds)
             episode = Episode(event=event, generation=generation, attempt=attempt, next_due=current + delay)
             self._episodes[event.key] = episode
             self._active_turn[event.thread_id] = event.turn_id
@@ -358,7 +375,8 @@ class RecoveryEngine:
             return Decision("cancel", reason, episode.event)
 
     def _delay(self, attempt: int) -> float:
-        base = min(self.max_delay, self.initial_delay * (2**min(attempt, 63)))
+        index = min(max(0, attempt), len(self.retry_delays) - 1)
+        base = min(self.max_delay, self.retry_delays[index])
         if not self.jitter_ratio or base == 0:
             return base
         jitter = base * self.jitter_ratio
@@ -877,6 +895,113 @@ def probe_cli_daemon(runtime: Optional[Path]) -> dict[str, Any]:
         return result
 
 
+def _discover_cli_executable() -> Optional[Path]:
+    found = shutil.which("codex") or shutil.which("codex.exe")
+    return Path(found) if found else None
+
+
+def _background_creationflags() -> int:
+    return (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
+            getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _wait_for_cli_daemon(runtime: Path, timeout: float = 20.0) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.5, timeout)
+    latest: dict[str, Any] = {"available": False, "reason": "daemon_start_timeout"}
+    while time.monotonic() < deadline:
+        latest = probe_cli_daemon(runtime)
+        if latest.get("available"):
+            return latest
+        time.sleep(0.5)
+    return latest
+
+
+def _start_managed_daemon(runtime: Path) -> bool:
+    candidates: list[Path] = []
+    command = _discover_cli_executable()
+    if command is not None:
+        candidates.append(command)
+    if runtime not in candidates:
+        candidates.append(runtime)
+    for executable in candidates:
+        try:
+            completed = subprocess.run(
+                [str(executable), "app-server", "daemon", "start"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode == 0:
+            return True
+    return False
+
+
+def _start_direct_daemon(runtime: Path) -> Optional[int]:
+    existing_pid = _read_pid("app_server")
+    if _process_alive(existing_pid):
+        return existing_pid
+    _clear_pid("app_server")
+    socket_path = cli_daemon_socket_path()
+    if socket_path.exists():
+        # A socket that did not answer the read-only probe may belong to an
+        # unknown process. Do not delete it or start a second server over it.
+        return None
+    directory = _appdata_dir()
+    if directory is None:
+        return None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        codex_home_path().mkdir(parents=True, exist_ok=True)
+        process = subprocess.Popen(
+            [str(runtime), "app-server", "--listen", "unix://"],
+            cwd=str(codex_home_path()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_background_creationflags(),
+        )
+        _write_pid("app_server", process.pid)
+        return process.pid
+    except OSError:
+        return None
+
+
+def ensure_cli_daemon(runtime: Optional[Path]) -> dict[str, Any]:
+    """Ensure one shared local daemon exists without touching user sessions."""
+    if runtime is None:
+        return {"available": False, "reason": "Codex runtime not found"}
+    existing = probe_cli_daemon(runtime)
+    if existing.get("available"):
+        existing["started"] = False
+        existing["route"] = "existing_shared_daemon"
+        return existing
+
+    managed_started = _start_managed_daemon(runtime)
+    after_managed = _wait_for_cli_daemon(runtime, timeout=8.0) if managed_started else existing
+    if after_managed.get("available"):
+        after_managed["started"] = managed_started
+        after_managed["route"] = "managed_daemon"
+        return after_managed
+
+    direct_pid = _start_direct_daemon(runtime)
+    if direct_pid is None:
+        return {
+            "available": False,
+            "started": False,
+            "route": "none",
+            "reason": "shared daemon unavailable and direct socket is occupied or cannot start",
+        }
+    result = _wait_for_cli_daemon(runtime)
+    result["started"] = bool(result.get("available"))
+    result["route"] = "bundled_app_server"
+    result["pid"] = direct_pid
+    return result
+
+
 def cli_native_retry(runtime: Path, thread_id: str, failed_turn_id: str) -> dict[str, Any]:
     """Send one minimal empty-input continuation through the shared daemon.
 
@@ -1189,9 +1314,9 @@ def default_config() -> dict[str, Any]:
         "enabled": True,
         "dry_run": True,
         "retry_mode": "dry_run",
-        "initial_delay_seconds": 5.0,
+        "retry_delays_seconds": list(DEFAULT_RETRY_DELAYS),
         "max_delay_seconds": 60.0,
-        "max_attempts": 5,
+        "max_attempts": 0,
         "jitter_ratio": 0.2,
         "poll_seconds": 5.0,
         "sessions_dir": str(Path(user_profile) / ".codex" / "sessions"),
@@ -1214,11 +1339,67 @@ def load_config() -> dict[str, Any]:
     return config
 
 
-def append_log(entry: dict[str, Any]) -> None:
+def _appdata_dir() -> Optional[Path]:
     appdata = os.environ.get("APPDATA")
-    if not appdata:
+    return Path(appdata) / "CodexNativeRetry" if appdata else None
+
+
+def _pid_file(kind: str) -> Optional[Path]:
+    directory = _appdata_dir()
+    filename = PID_FILENAMES.get(kind)
+    return directory / filename if directory is not None and filename else None
+
+
+def _read_pid(kind: str) -> Optional[int]:
+    path = _pid_file(kind)
+    if path is None:
+        return None
+    try:
+        value = int(path.read_text(encoding="ascii").strip())
+        return value if value > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _process_alive(pid: Optional[int]) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _write_pid(kind: str, pid: int) -> None:
+    path = _pid_file(kind)
+    if path is None:
         return
-    path = Path(appdata) / "CodexNativeRetry" / "events.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(pid), encoding="ascii")
+    except OSError:
+        pass
+
+
+def _clear_pid(kind: str, pid: Optional[int] = None) -> None:
+    path = _pid_file(kind)
+    if path is None:
+        return
+    try:
+        if pid is None or path.read_text(encoding="ascii").strip() == str(pid):
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def append_log(entry: dict[str, Any]) -> None:
+    directory = _appdata_dir()
+    if directory is None:
+        return
+    path = directory / "events.jsonl"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         allowed = {"event", "thread", "turn", "kind", "error_type", "will_retry", "decision", "reason", "attempt", "mode"}
@@ -1232,8 +1413,8 @@ def append_log(entry: dict[str, Any]) -> None:
 
 
 def _status_file() -> Optional[Path]:
-    appdata = os.environ.get("APPDATA")
-    return Path(appdata) / "CodexNativeRetry" / "observer-status.json" if appdata else None
+    directory = _appdata_dir()
+    return directory / "observer-status.json" if directory is not None else None
 
 
 def read_observer_status() -> dict[str, Any]:
@@ -1261,6 +1442,7 @@ def write_observer_status(
     payload = {
         "timestamp": utc_now(),
         "running": running,
+        "watcher_pid": os.getpid() if running else None,
         "sessions_dir": str(watcher.sessions_dir),
         "current_threads_observed": len({item["thread"] for item in snapshot if item["thread"] != "-"}),
         "current_error_episodes": snapshot,
@@ -1370,8 +1552,15 @@ $pattern.Invoke()
 
 
 def make_engine(config: dict[str, Any]) -> RecoveryEngine:
+    configured_delays = config.get("retry_delays_seconds", DEFAULT_RETRY_DELAYS)
+    if not isinstance(configured_delays, (list, tuple)):
+        configured_delays = list(DEFAULT_RETRY_DELAYS)
+    try:
+        retry_delays = [float(value) for value in configured_delays]
+    except (TypeError, ValueError):
+        retry_delays = list(DEFAULT_RETRY_DELAYS)
     return RecoveryEngine(
-        initial_delay=float(config["initial_delay_seconds"]),
+        retry_delays=retry_delays,
         max_delay=float(config["max_delay_seconds"]),
         max_attempts=int(config["max_attempts"]),
         jitter_ratio=float(config["jitter_ratio"]),
@@ -1385,12 +1574,118 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
     report["sessions_dir"] = str(Path(os.path.expandvars(config["sessions_dir"])).expanduser())
     report["dry_run_default"] = bool(config["dry_run"])
     report["configured_retry_mode"] = config.get("retry_mode", "dry_run")
+    report["retry_delays_seconds"] = config.get("retry_delays_seconds", list(DEFAULT_RETRY_DELAYS))
+    report["max_attempts"] = config.get("max_attempts", 0)
+    report["jitter_ratio"] = config.get("jitter_ratio", 0.2)
+    report["watcher_pid"] = _read_pid("watcher") if _process_alive(_read_pid("watcher")) else None
+    report["app_server_pid"] = _read_pid("app_server") if _process_alive(_read_pid("app_server")) else None
     report["ui_automation"] = {"available": False, "reason": "ignored_for_cli_target"}
     report["target"] = "codex_cli"
     report["retry_mode"] = "native_cli" if report.get("cli_daemon_available") else "disabled_no_shared_daemon"
-    report["observer"] = read_observer_status()
+    observer = read_observer_status()
+    observer_pid = observer.get("watcher_pid") if isinstance(observer, dict) else None
+    if observer.get("running") and not _process_alive(observer_pid if isinstance(observer_pid, int) else _read_pid("watcher")):
+        observer["running"] = False
+    report["observer"] = observer
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["codex_detected"] else 1
+
+
+def _spawn_watcher(runtime: Path, *, mode: str, sessions_dir: Optional[str]) -> dict[str, Any]:
+    existing_pid = _read_pid("watcher")
+    if _process_alive(existing_pid):
+        return {"running": True, "started": False, "pid": existing_pid, "reason": "already_running"}
+    _clear_pid("watcher")
+    command = [sys.executable, str(Path(__file__).resolve()), "watch"]
+    if mode == "dry_run":
+        command.append("--dry-run")
+    else:
+        command.extend(["--live", "--retry-mode", "native_cli"])
+    command.extend(["--runtime", str(runtime)])
+    if sessions_dir:
+        command.extend(["--sessions-dir", sessions_dir])
+    directory = _appdata_dir()
+    log_stream: Any = subprocess.DEVNULL
+    log_path: Optional[Path] = None
+    try:
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)
+            log_path = directory / "watcher.log"
+            log_stream = log_path.open("ab")
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_stream,
+            stderr=subprocess.STDOUT,
+            creationflags=_background_creationflags(),
+        )
+    except OSError as exc:
+        if hasattr(log_stream, "close"):
+            log_stream.close()
+        return {"running": False, "started": False, "reason": f"watcher_start_failed:{type(exc).__name__}"}
+    finally:
+        if hasattr(log_stream, "close"):
+            log_stream.close()
+
+    deadline = time.monotonic() + 5.0
+    child_pid: Optional[int] = None
+    while time.monotonic() < deadline:
+        child_pid = _read_pid("watcher")
+        if _process_alive(child_pid):
+            break
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    running = _process_alive(child_pid)
+    return {
+        "running": running,
+        "started": running,
+        "pid": child_pid if running else None,
+        "reason": "started" if running else "watcher_exited_during_start",
+        "log": str(log_path) if log_path else None,
+    }
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """Start the shared daemon and one watcher for every saved CLI rollout."""
+    config = load_config()
+    if not config.get("enabled", True):
+        print(json.dumps({"event": "start", "enabled": False}, ensure_ascii=False))
+        return 0
+    mode = "dry_run" if args.dry_run else (args.retry_mode or "native_cli")
+    if mode not in {"dry_run", "native_cli"}:
+        print("start supports only dry_run or native_cli", file=sys.stderr)
+        return 2
+    runtime = discover_runtime(args.runtime or config.get("runtime_path"))
+    if runtime is None:
+        runtime = _discover_cli_executable()
+    if runtime is None:
+        print("Codex runtime was not found; pass --runtime C:\\path\\to\\codex.exe", file=sys.stderr)
+        return 3
+
+    daemon = ensure_cli_daemon(runtime)
+    if not daemon.get("available"):
+        append_log({"event": "service_start_failed", "mode": mode, "reason": daemon.get("reason", "daemon_unavailable")})
+        print(json.dumps({"event": "start", "daemon": daemon, "watcher": {"running": False}}, ensure_ascii=False))
+        return 3
+    sessions_dir = args.sessions_dir or config.get("sessions_dir")
+    watcher = _spawn_watcher(runtime, mode=mode, sessions_dir=sessions_dir)
+    append_log({"event": "service_started", "mode": mode,
+                "reason": daemon.get("route", "shared_daemon")})
+    print(json.dumps({
+        "event": "start",
+        "mode": mode,
+        "daemon": {
+            "available": bool(daemon.get("available")),
+            "route": daemon.get("route"),
+            "started": bool(daemon.get("started")),
+            "pid": daemon.get("pid"),
+        },
+        "watcher": watcher,
+        "sessions_dir": str(Path(os.path.expandvars(sessions_dir)).expanduser()) if sessions_dir else None,
+        "note": "Use codex --remote unix:// for CLI conversations that can receive native continuation.",
+    }, ensure_ascii=False, indent=2))
+    return 0 if watcher.get("running") else 3
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -1439,6 +1734,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if not config.get("enabled", True):
         print("disabled")
         return 0
+    existing_pid = _read_pid("watcher")
+    if existing_pid != os.getpid() and _process_alive(existing_pid):
+        print(json.dumps({"event": "watcher_already_running", "pid": existing_pid}, ensure_ascii=False))
+        return 0
+    _clear_pid("watcher")
+    _write_pid("watcher", os.getpid())
     sessions_dir = Path(os.path.expandvars(args.sessions_dir or config["sessions_dir"])).expanduser()
     engine = make_engine(config)
     def observe(entry: dict[str, Any]) -> None:
@@ -1518,6 +1819,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 0
     finally:
         write_observer_status(engine, watcher, last_retry, running=False)
+        _clear_pid("watcher", os.getpid())
 
 
 def cmd_request(args: argparse.Namespace) -> int:
@@ -1538,6 +1840,13 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose = sub.add_parser("diagnose")
     diagnose.add_argument("--runtime")
     diagnose.set_defaults(func=cmd_diagnose)
+
+    start = sub.add_parser("start", help="start one shared app-server and the background watcher")
+    start.add_argument("--dry-run", action="store_true", help="observe only; do not send native retry")
+    start.add_argument("--sessions-dir")
+    start.add_argument("--runtime")
+    start.add_argument("--retry-mode", choices=("dry_run", "native_cli"))
+    start.set_defaults(func=cmd_start)
 
     watch = sub.add_parser("watch")
     watch.add_argument("--dry-run", action="store_true")

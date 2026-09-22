@@ -26,6 +26,7 @@ No `clientUserMessageId`, prompt, `turnTrigger`, model, effort, cwd, workspace r
 - Structured type takes priority; the exact capacity text is used only when no type exists.
 - New turn or user activity cancels the previous episode.
 - Usage limits, context-window, policy, and unknown failures do not trigger recovery.
-- Recognized retry-after seconds may lengthen the local wait.
+- Consecutive capacity failures use `0, 3, 5, 10, 15, 30, 60...` seconds with bounded jitter; a successful continuation or new task resets the sequence.
+- Recognized retry-after seconds may lengthen the local wait up to the configured 60-second cap.
 
 The local control socket and experimental methods may change between Codex releases. Missing methods/fields stop recovery. This is runtime shape checking, not certification against every future protocol version.

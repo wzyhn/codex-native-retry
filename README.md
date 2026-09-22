@@ -13,10 +13,10 @@ No synthetic “continue” message, prompt replay, new conversation, or model/p
 ## Requirements
 
 - Windows 10/11, Python 3.10+ (standard library only).
-- A compatible Codex runtime and a CLI session connected to a **shared local app-server**.
+- A compatible Codex runtime and CLI sessions connected to a **shared local app-server**.
 - Tested with runtime `0.154.0-alpha.6.2` and CLI `0.155.1`. Protocols change; other versions require verification.
 
-A normal CLI session using its own stdio server cannot be attached to. Starting this watcher alone does not make an existing stdio session recoverable.
+A normal CLI session using its own stdio server cannot be attached to. The one-command launcher starts the shared server and watcher, but future conversations must connect with `--remote unix://`.
 
 ## Quick start
 
@@ -26,27 +26,26 @@ Clone this repository and open PowerShell in its root:
 git clone https://github.com/wzyhn/codex-native-retry.git
 cd codex-native-retry
 python .\src\codex_native_retry.py diagnose
-python .\src\codex_native_retry.py watch --dry-run
+.\start.ps1 -DryRun
 ```
 
-Dry-run observes errors and records `would_retry` without starting a turn.
-
-For live recovery, keep these running in separate terminals:
+Dry-run observes errors and records `would_retry` without starting a turn. For live recovery, run:
 
 ```powershell
-# Terminal 1: local shared server (keep this terminal open)
-codex app-server --listen unix://
-
-# Terminal 2: choose and resume your existing conversation
-codex --remote unix:// resume
-
-# Terminal 3: from this repository
-python .\src\codex_native_retry.py watch --live --retry-mode native_cli
+.\start.ps1
 ```
 
-Close the old stdio CLI before opening the same conversation through `--remote`. A managed standalone installation can alternatively use `codex app-server daemon start`.
+This starts one shared local app-server (managed daemon when available, otherwise the bundled runtime) and one background watcher. The watcher tails the Codex home session directory, so it covers all threads visible through that shared daemon. It does not take over a CLI process that owns a private stdio server.
 
-If runtime discovery fails, pass the actual `codex.exe` path with `--runtime` to both `diagnose` and `watch`, or set `runtime_path` in the configuration. Discovery currently checks the Desktop runtime cache; an explicit CLI executable also works. If `codex app-server` is unavailable in your shell, use that executable to run the server.
+Use the shared daemon for each conversation:
+
+```powershell
+codex --remote unix:// resume
+```
+
+Close the old stdio CLI before opening the same conversation through `--remote`. A managed standalone installation can alternatively use `codex app-server daemon start`; `start.ps1` tries that route first.
+
+If runtime discovery fails, pass the actual `codex.exe` path with `--runtime` to `start.ps1` or set `runtime_path` in the configuration. Discovery currently checks the Desktop runtime cache; an explicit CLI executable also works.
 
 ## When it acts
 
@@ -57,6 +56,7 @@ Only a terminal `serverOverloaded` / `server_overloaded` failure is eligible. Th
 - Immediately before sending, the daemon must show `idle` or `systemError` and the **same latest failed turn**, still classified as capacity.
 - An active/unloaded thread, new turn, manual retry, or new user message blocks the old episode.
 - A transport timeout after sending stops the episode; an ambiguous request is never blindly retransmitted.
+- Consecutive capacity failures use `0, 3, 5, 10, 15, 30, 60, 60...` seconds before jitter. A successful continuation or a new task starts again at zero seconds.
 
 The continuation creates a new native turn inside the same thread. `accepted` means the server accepted the request; it does not guarantee model capacity is available or the task finishes.
 
@@ -69,22 +69,23 @@ The continuation creates a new native turn inside the same thread. `accepted` me
   "enabled": true,
   "dry_run": true,
   "retry_mode": "dry_run",
-  "initial_delay_seconds": 5,
+  "retry_delays_seconds": [0, 3, 5, 10, 15, 30, 60],
   "max_delay_seconds": 60,
-  "max_attempts": 5,
+  "max_attempts": 0,
   "jitter_ratio": 0.2,
   "poll_seconds": 5,
   "runtime_path": null
 }
 ```
 
-Backoff doubles from 5 seconds, with jitter, capped at 60 seconds. Recognized retry-after metadata may extend the wait. `max_attempts: 0` opts into unlimited attempts. The attempt budget is currently in memory and resets on restart.
+The schedule is applied only while the same thread keeps producing consecutive capacity failures. Jitter is symmetric at ±20% by default and each interval is capped at 60 seconds. `max_attempts: 0` means continue at the 60-second interval until the episode is cancelled or succeeds. The attempt budget is in memory and resets on restart.
 
 ```powershell
 python .\src\codex_native_retry.py diagnose
 Get-Content "$env:APPDATA\CodexNativeRetry\events.jsonl" -Tail 20
-.\install.ps1 -StartWithWindows  # optional startup entry, dry-run only
-.\uninstall.ps1                # remove that startup entry
+.\install.ps1 -StartWithWindows -Live  # optional live startup entry
+.\start.ps1 -DryRun                    # one-shot passive startup
+.\uninstall.ps1                         # remove that startup entry
 ```
 
 Logs retain identifiers as short hashes and decision metadata, not conversation bodies or tool contents. Diagnose prints local installation paths; review them before sharing.

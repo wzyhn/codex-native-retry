@@ -9,7 +9,7 @@
 
 ## Supporting evidence
 
-The upstream empty-input test checks that no empty user message is synthesized. A local capacity failure recovered through the companion produced an accepted response followed by a new turn in the same thread. Another terminal capacity failure entered the next backoff attempt.
+The upstream empty-input test checks that no empty user message is synthesized. A local capacity failure recovered through the companion produced an accepted response followed by a new turn in the same thread. Another terminal capacity failure entered the next backoff attempt. The scheduler unit tests verify the live sequence `0, 3, 5, 10, 15, 30, 60...`, jitter bounds, and reset after a successful continuation/new task.
 
 The latest failed turn is checked before each write, including failures that predate watcher startup. A `systemError` thread is allowed only after that capacity check.
 

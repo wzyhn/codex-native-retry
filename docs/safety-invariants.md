@@ -9,6 +9,8 @@ Implemented boundaries:
 - Check non-active loaded status and the exact latest failed capacity turn before sending.
 - Do not supply optional settings overrides.
 - Cancel obsolete episodes on new turns or user activity.
+- The consecutive-failure schedule is bounded at 60 seconds; a successful continuation or new task resets it to an immediate first retry.
+- The one-command launcher starts only the shared local daemon and watcher; it does not change Codex permissions, sandbox, model, or configuration.
 - Stop after an ambiguous send result.
 - Persist metadata only: hashed IDs, classification, attempts, and decisions.
 

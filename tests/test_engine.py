@@ -14,6 +14,40 @@ def capacity(thread="thread-1", turn="turn-1", will_retry=False):
 
 
 class RecoveryEngineTests(unittest.TestCase):
+    def test_default_first_retry_is_immediate(self):
+        engine = RecoveryEngine(jitter_ratio=0)
+        engine.handle_error(capacity(), now=0)
+        self.assertEqual(len(engine.poll_due(now=0)), 1)
+
+    def test_requested_consecutive_capacity_schedule(self):
+        engine = RecoveryEngine(jitter_ratio=0, max_attempts=0)
+        engine.handle_error(capacity(), now=0)
+        episode = engine.poll_due(now=0)[0]
+        expected = [3, 5, 10, 15, 30, 60, 60]
+        for delay in expected:
+            self.assertEqual(engine.native_result(episode, False, now=0).action, "pending")
+            self.assertEqual(len(engine.poll_due(now=delay - 0.01)), 0)
+            self.assertEqual(len(engine.poll_due(now=delay)), 1)
+
+    def test_success_then_new_turn_resets_to_immediate(self):
+        engine = RecoveryEngine(jitter_ratio=0)
+        engine.handle_error(capacity(turn="turn-1"), now=0)
+        episode = engine.poll_due(now=0)[0]
+        engine.native_result(episode, True, next_turn_id="turn-2")
+        engine.handle_activity(ActivityEvent("now", "thread-1", "turn-3", "turn_started"))
+        engine.handle_error(capacity(turn="turn-3"), now=10)
+        self.assertEqual(len(engine.poll_due(now=10)), 1)
+
+    def test_jitter_stays_within_configured_bounds(self):
+        low = RecoveryEngine(retry_delays=[3], jitter_ratio=0.2, random_fn=lambda: 0.0)
+        high = RecoveryEngine(retry_delays=[3], jitter_ratio=0.2, random_fn=lambda: 1.0)
+        low.handle_error(capacity(), now=0)
+        high.handle_error(capacity(thread="thread-2"), now=0)
+        self.assertEqual(len(low.poll_due(now=2.39)), 0)
+        self.assertEqual(len(low.poll_due(now=2.4)), 1)
+        self.assertEqual(len(high.poll_due(now=3.59)), 0)
+        self.assertEqual(len(high.poll_due(now=3.6)), 1)
+
     def test_a_will_retry_true_does_not_schedule(self):
         engine = RecoveryEngine(initial_delay=5, jitter_ratio=0)
         self.assertEqual(engine.handle_error(capacity(will_retry=True), now=0).action, "ignore")
